@@ -53,9 +53,7 @@ void AppendLogLine(LogLevel log_level, const char prefix_char, size_t written);
 template <typename... Args>
 void AppendLogLineFormat(LogLevel log_level, const char prefix_char,
                          const char* format, const Args&... args) {
-  if (!internal::ShouldLog(log_level)) {
-    return;
-  }
+  return;
   auto target = internal::GetThreadBuffer();
   auto result = fmt::format_to_n(target.first, target.second, format, args...);
   internal::AppendLogLine(log_level, prefix_char, result.size);

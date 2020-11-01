@@ -7,6 +7,14 @@
  ******************************************************************************
  */
 
+/*
+改变Xbox360手柄的按键：
+1.方向键改为编辑键区
+2.ABXY改为ZXCV
+3.Start和Back改为ENTER和ESC
+4.Right stick改为P ; , L '
+*/
+
 #include "xenia/hid/winkey/winkey_input_driver.h"
 
 #include "xenia/base/platform_win.h"
@@ -182,11 +190,11 @@ X_RESULT WinKeyInputDriver::GetState(uint32_t user_index,
       right_trigger = 0xFF;
     }
 
-    if (IS_KEY_DOWN('A')) {
+    if (IS_KEY_DOWN(VK_ESCAPE)) {
       // Z
       buttons |= 0x0020;  // XINPUT_GAMEPAD_BACK
     }
-    if (IS_KEY_DOWN('S')) {
+    if (IS_KEY_DOWN(VK_RETURN)) {
       // X
       buttons |= 0x0010;  // XINPUT_GAMEPAD_START
     }
