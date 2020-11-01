@@ -91,37 +91,37 @@ X_RESULT WinKeyInputDriver::GetState(uint32_t user_index,
   if (window_->has_focus()) {
     if (IS_KEY_TOGGLED(VK_CAPITAL) || IS_KEY_DOWN(VK_SHIFT)) {
       // dpad toggled
-      if (IS_KEY_DOWN('A')) {
+      if (IS_KEY_DOWN(VK_LEFT)) {
         // A
         buttons |= 0x0004;  // XINPUT_GAMEPAD_DPAD_LEFT
       }
-      if (IS_KEY_DOWN('D')) {
+      if (IS_KEY_DOWN(VK_RIGHT)) {
         // D
         buttons |= 0x0008;  // XINPUT_GAMEPAD_DPAD_RIGHT
       }
-      if (IS_KEY_DOWN('S')) {
+      if (IS_KEY_DOWN(VK_DOWN)) {
         // S
         buttons |= 0x0002;  // XINPUT_GAMEPAD_DPAD_DOWN
       }
-      if (IS_KEY_DOWN('W')) {
+      if (IS_KEY_DOWN(VK_UP)) {
         // W
         buttons |= 0x0001;  // XINPUT_GAMEPAD_DPAD_UP
       }
     } else {
       // left stick
-      if (IS_KEY_DOWN('A')) {
+      if (IS_KEY_DOWN(VK_LEFT)) {
         // A
         thumb_lx += SHRT_MIN;
       }
-      if (IS_KEY_DOWN('D')) {
+      if (IS_KEY_DOWN(VK_RIGHT)) {
         // D
         thumb_lx += SHRT_MAX;
       }
-      if (IS_KEY_DOWN('S')) {
+      if (IS_KEY_DOWN(VK_DOWN)) {
         // S
         thumb_ly += SHRT_MIN;
       }
-      if (IS_KEY_DOWN('W')) {
+      if (IS_KEY_DOWN(VK_UP)) {
         // W
         thumb_ly += SHRT_MAX;
       }
@@ -133,36 +133,36 @@ X_RESULT WinKeyInputDriver::GetState(uint32_t user_index,
     }
 
     // Right stick
-    if (IS_KEY_DOWN(VK_UP)) {
+    if (IS_KEY_DOWN('P')) {
       // Up
       thumb_ry += SHRT_MAX;
     }
-    if (IS_KEY_DOWN(VK_DOWN)) {
+    if (IS_KEY_DOWN(VK_OEM_1)) {
       // Down
       thumb_ry += SHRT_MIN;
     }
-    if (IS_KEY_DOWN(VK_RIGHT)) {
+    if (IS_KEY_DOWN(VK_OEM_7)) {
       // Right
       thumb_rx += SHRT_MAX;
     }
-    if (IS_KEY_DOWN(VK_LEFT)) {
+    if (IS_KEY_DOWN('L')) {
       // Left
       thumb_rx += SHRT_MIN;
     }
 
-    if (IS_KEY_DOWN('L')) {
+    if (IS_KEY_DOWN('C')) {
       // L
       buttons |= 0x4000;  // XINPUT_GAMEPAD_X
     }
-    if (IS_KEY_DOWN(VK_OEM_7)) {
+    if (IS_KEY_DOWN('X')) {
       // '
       buttons |= 0x2000;  // XINPUT_GAMEPAD_B
     }
-    if (IS_KEY_DOWN(VK_OEM_1)) {
+    if (IS_KEY_DOWN('Z')) {
       // ;
       buttons |= 0x1000;  // XINPUT_GAMEPAD_A
     }
-    if (IS_KEY_DOWN('P')) {
+    if (IS_KEY_DOWN('V')) {
       // P
       buttons |= 0x8000;  // XINPUT_GAMEPAD_Y
     }
@@ -182,11 +182,11 @@ X_RESULT WinKeyInputDriver::GetState(uint32_t user_index,
       right_trigger = 0xFF;
     }
 
-    if (IS_KEY_DOWN('Z')) {
+    if (IS_KEY_DOWN('A')) {
       // Z
       buttons |= 0x0020;  // XINPUT_GAMEPAD_BACK
     }
-    if (IS_KEY_DOWN('X')) {
+    if (IS_KEY_DOWN('S')) {
       // X
       buttons |= 0x0010;  // XINPUT_GAMEPAD_START
     }
