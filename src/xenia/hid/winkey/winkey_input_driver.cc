@@ -11,7 +11,7 @@
 改变Xbox360手柄的按键：
 1.方向键改为编辑键区
 2.ABXY改为ZXCV
-3.Start和Back改为ENTER和ESC
+3.Start和Back改为ENTER和BACKSPACE
 4.Right stick改为P ; , L '
 */
 
@@ -190,7 +190,7 @@ X_RESULT WinKeyInputDriver::GetState(uint32_t user_index,
       right_trigger = 0xFF;
     }
 
-    if (IS_KEY_DOWN(VK_ESCAPE)) {
+    if (IS_KEY_DOWN(VK_BACK)) {
       // Z
       buttons |= 0x0020;  // XINPUT_GAMEPAD_BACK
     }

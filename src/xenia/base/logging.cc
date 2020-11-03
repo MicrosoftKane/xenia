@@ -312,18 +312,14 @@ std::pair<char*, size_t> logging::internal::GetThreadBuffer() {
 
 void logging::internal::AppendLogLine(LogLevel log_level,
                                       const char prefix_char, size_t written) {
-  if (!ShouldLog(log_level) || !written) {
-    return;
-  }
+  return;
   logger_->AppendLine(xe::threading::current_thread_id(), prefix_char,
                       thread_log_buffer_, written);
 }
 
 void logging::AppendLogLine(LogLevel log_level, const char prefix_char,
                             const std::string_view str) {
-  if (!internal::ShouldLog(log_level) || !str.size()) {
-    return;
-  }
+  return;
   logger_->AppendLine(xe::threading::current_thread_id(), prefix_char,
                       str.data(), str.size());
 }

@@ -84,6 +84,7 @@ void XELOGW(const char* format, const Args&... args) {
 
 template <typename... Args>
 void XELOGI(const char* format, const Args&... args) {
+  return;
   xe::logging::AppendLogLineFormat(xe::LogLevel::Info, 'i', format, args...);
 }
 
