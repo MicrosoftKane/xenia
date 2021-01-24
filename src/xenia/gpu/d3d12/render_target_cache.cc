@@ -535,7 +535,8 @@ void RenderTargetCache::EndFrame() {
   FlushAndUnbindRenderTargets();
 }
 
-bool RenderTargetCache::UpdateRenderTargets(const D3D12Shader* pixel_shader) {
+bool RenderTargetCache::UpdateRenderTargets(
+    uint32_t shader_writes_color_targets) {
   // There are two kinds of render target binding updates in this implementation
   // in case something has been changed - full and partial.
   //
@@ -635,7 +636,8 @@ bool RenderTargetCache::UpdateRenderTargets(const D3D12Shader* pixel_shader) {
   uint32_t edram_bases[5];
   uint32_t formats[5];
   bool formats_are_64bpp[5];
-  uint32_t color_mask = command_processor_.GetCurrentColorMask(pixel_shader);
+  uint32_t color_mask =
+      command_processor_.GetCurrentColorMask(shader_writes_color_targets);
   for (uint32_t i = 0; i < 4; ++i) {
     enabled[i] = (color_mask & (0xF << (i * 4))) != 0;
     auto color_info = regs.Get<reg::RB_COLOR_INFO>(
@@ -645,7 +647,7 @@ bool RenderTargetCache::UpdateRenderTargets(const D3D12Shader* pixel_shader) {
     formats_are_64bpp[i] = xenos::IsColorRenderTargetFormat64bpp(
         xenos::ColorRenderTargetFormat(formats[i]));
   }
-  auto rb_depthcontrol = regs.Get<reg::RB_DEPTHCONTROL>();
+  auto rb_depthcontrol = draw_util::GetDepthControlForCurrentEdramMode(regs);
   auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
   // 0x1 = stencil test, 0x2 = depth test.
   enabled[4] = rb_depthcontrol.stencil_enable || rb_depthcontrol.z_enable;

@@ -18,6 +18,7 @@
 #include <mutex>
 #include <set>
 #include <utility>
+#include <vector>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
@@ -29,8 +30,10 @@
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/string.h"
+#include "xenia/base/string_buffer.h"
 #include "xenia/base/xxhash.h"
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
+#include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 
@@ -265,7 +268,7 @@ void PipelineCache::InitializeShaderStorage(
   // collect used shader modifications to translate.
   std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
   // <Shader hash, modification bits>.
-  std::set<std::pair<uint64_t, uint32_t>> shader_translations_needed;
+  std::set<std::pair<uint64_t, uint64_t>> shader_translations_needed;
   auto pipeline_storage_file_path =
       shader_storage_shareable_root /
       fmt::format("{:08X}.{}.d3d12.xpso", title_id,
@@ -292,7 +295,6 @@ void PipelineCache::InitializeShaderStorage(
     uint32_t magic;
     uint32_t magic_api;
     uint32_t version_swapped;
-    uint32_t device_features;
   } pipeline_storage_file_header;
   if (fread(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header),
             1, pipeline_storage_file_) &&
@@ -331,6 +333,9 @@ void PipelineCache::InitializeShaderStorage(
           pipeline_stored_descriptions.resize(i);
           break;
         }
+        // TODO(Triang3l): On Vulkan, skip pipelines requiring unsupported
+        // device features (to keep the cache files mostly shareable across
+        // devices).
         // Mark the shader modifications as needed for translation.
         shader_translations_needed.emplace(
             pipeline_stored_description.description.vertex_shader_hash,
@@ -391,14 +396,14 @@ void PipelineCache::InitializeShaderStorage(
     // Threads overlapping file reading.
     std::mutex shaders_translation_thread_mutex;
     std::condition_variable shaders_translation_thread_cond;
-    std::deque<std::pair<ShaderStoredHeader, D3D12Shader::D3D12Translation*>>
-        shaders_to_translate;
+    std::deque<D3D12Shader*> shaders_to_translate;
     size_t shader_translation_threads_busy = 0;
     bool shader_translation_threads_shutdown = false;
     std::mutex shaders_failed_to_translate_mutex;
     std::vector<D3D12Shader::D3D12Translation*> shaders_failed_to_translate;
     auto shader_translation_thread_function = [&]() {
       auto& provider = command_processor_.GetD3D12Context().GetD3D12Provider();
+      StringBuffer ucode_disasm_buffer;
       DxbcShaderTranslator translator(
           provider.GetAdapterVendorID(), bindless_resources_used_,
           edram_rov_used_, provider.GetGraphicsAnalysis() != nullptr);
@@ -416,8 +421,7 @@ void PipelineCache::InitializeShaderStorage(
                                    IID_PPV_ARGS(&dxc_compiler));
       }
       for (;;) {
-        std::pair<ShaderStoredHeader, D3D12Shader::D3D12Translation*>
-            shader_to_translate;
+        D3D12Shader* shader_to_translate;
         for (;;) {
           std::unique_lock<std::mutex> lock(shaders_translation_thread_mutex);
           if (shaders_to_translate.empty()) {
@@ -432,12 +436,29 @@ void PipelineCache::InitializeShaderStorage(
           ++shader_translation_threads_busy;
           break;
         }
-        assert_not_null(shader_to_translate.second);
-        if (!TranslateShader(translator, *shader_to_translate.second,
-                             shader_to_translate.first.sq_program_cntl,
-                             dxbc_converter, dxc_utils, dxc_compiler)) {
-          std::lock_guard<std::mutex> lock(shaders_failed_to_translate_mutex);
-          shaders_failed_to_translate.push_back(shader_to_translate.second);
+        shader_to_translate->AnalyzeUcode(ucode_disasm_buffer);
+        // Translate each needed modification on this thread after performing
+        // modification-independent analysis of the whole shader.
+        uint64_t ucode_data_hash = shader_to_translate->ucode_data_hash();
+        for (auto modification_it = shader_translations_needed.lower_bound(
+                 std::make_pair(ucode_data_hash, uint64_t(0)));
+             modification_it != shader_translations_needed.end() &&
+             modification_it->first == ucode_data_hash;
+             ++modification_it) {
+          D3D12Shader::D3D12Translation* translation =
+              static_cast<D3D12Shader::D3D12Translation*>(
+                  shader_to_translate->GetOrCreateTranslation(
+                      modification_it->second));
+          // Only try (and delete in case of failure) if it's a new translation.
+          // If it's a shader previously encountered in the game, translation of
+          // which has failed, and the shader storage is loaded later, keep it
+          // this way not to try to translate it again.
+          if (!translation->is_translated() &&
+              !TranslateAnalyzedShader(translator, *translation, dxbc_converter,
+                                       dxc_utils, dxc_compiler)) {
+            std::lock_guard<std::mutex> lock(shaders_failed_to_translate_mutex);
+            shaders_failed_to_translate.push_back(translation);
+          }
         }
         {
           std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
@@ -477,59 +498,41 @@ void PipelineCache::InitializeShaderStorage(
         break;
       }
       shader_storage_valid_bytes += sizeof(shader_header) + ucode_byte_count;
-      // Only add the shader if needed.
-      auto modification_it = shader_translations_needed.lower_bound(
-          std::make_pair(ucode_data_hash, uint32_t(0)));
-      if (modification_it == shader_translations_needed.end() ||
-          modification_it->first != ucode_data_hash) {
-        continue;
-      }
       D3D12Shader* shader =
           LoadShader(shader_header.type, ucode_dwords.data(),
                      shader_header.ucode_dword_count, ucode_data_hash);
+      if (shader->ucode_storage_index() == shader_storage_index_) {
+        // Appeared twice in this file for some reason - skip, otherwise race
+        // condition will be caused by translating twice in parallel.
+        continue;
+      }
       // Loaded from the current storage - don't write again.
       shader->set_ucode_storage_index(shader_storage_index_);
-      // Translate all the needed modifications.
-      for (; modification_it != shader_translations_needed.end() &&
-             modification_it->first == ucode_data_hash;
-           ++modification_it) {
-        bool translation_is_new;
-        D3D12Shader::D3D12Translation* translation =
-            static_cast<D3D12Shader::D3D12Translation*>(
-                shader->GetOrCreateTranslation(modification_it->second,
-                                               &translation_is_new));
-        if (!translation_is_new) {
-          // Already added - usually shaders aren't added without the intention
-          // of translating them imminently, so don't do additional checks to
-          // actually ensure that translation happens right now (they would
-          // cause a race condition with shaders currently queued for
-          // translation).
-          continue;
-        }
-        // Create new threads if the currently existing threads can't keep up
-        // with file reading, but not more than the number of logical processors
-        // minus one.
-        size_t shader_translation_threads_needed;
-        {
-          std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
-          shader_translation_threads_needed =
-              std::min(shader_translation_threads_busy +
-                           shaders_to_translate.size() + size_t(1),
-                       logical_processor_count - size_t(1));
-        }
-        while (shader_translation_threads.size() <
-               shader_translation_threads_needed) {
-          shader_translation_threads.push_back(xe::threading::Thread::Create(
-              {}, shader_translation_thread_function));
-          shader_translation_threads.back()->set_name("Shader Translation");
-        }
-        {
-          std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
-          shaders_to_translate.emplace_back(shader_header, translation);
-        }
-        shaders_translation_thread_cond.notify_one();
-        ++shaders_translated;
+      // Create new threads if the currently existing threads can't keep up
+      // with file reading, but not more than the number of logical processors
+      // minus one.
+      size_t shader_translation_threads_needed;
+      {
+        std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
+        shader_translation_threads_needed =
+            std::min(shader_translation_threads_busy +
+                         shaders_to_translate.size() + size_t(1),
+                     logical_processor_count - size_t(1));
       }
+      while (shader_translation_threads.size() <
+             shader_translation_threads_needed) {
+        shader_translation_threads.push_back(xe::threading::Thread::Create(
+            {}, shader_translation_thread_function));
+        shader_translation_threads.back()->set_name("Shader Translation");
+      }
+      // Request ucode information gathering and translation of all the needed
+      // shaders.
+      {
+        std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
+        shaders_to_translate.push_back(shader);
+      }
+      shaders_translation_thread_cond.notify_one();
+      ++shaders_translated;
     }
     if (!shader_translation_threads.empty()) {
       {
@@ -593,6 +596,8 @@ void PipelineCache::InitializeShaderStorage(
          pipeline_stored_descriptions) {
       const PipelineDescription& pipeline_description =
           pipeline_stored_description.description;
+      // TODO(Triang3l): On Vulkan, skip pipelines requiring unsupported device
+      // features (to keep the cache files mostly shareable across devices).
       // Skip already known pipelines - those have already been enqueued.
       auto found_range =
           pipelines_.equal_range(pipeline_stored_description.description_hash);
@@ -621,6 +626,7 @@ void PipelineCache::InitializeShaderStorage(
               vertex_shader->GetTranslation(
                   pipeline_description.vertex_shader_modification));
       if (!pipeline_runtime_description.vertex_shader ||
+          !pipeline_runtime_description.vertex_shader->is_translated() ||
           !pipeline_runtime_description.vertex_shader->is_valid()) {
         continue;
       }
@@ -637,6 +643,7 @@ void PipelineCache::InitializeShaderStorage(
                 pixel_shader->GetTranslation(
                     pipeline_description.pixel_shader_modification));
         if (!pipeline_runtime_description.pixel_shader ||
+            !pipeline_runtime_description.pixel_shader->is_translated() ||
             !pipeline_runtime_description.pixel_shader->is_valid()) {
           continue;
         }
@@ -730,9 +737,6 @@ void PipelineCache::InitializeShaderStorage(
     pipeline_storage_file_header.magic_api = pipeline_storage_magic_api;
     pipeline_storage_file_header.version_swapped =
         pipeline_storage_version_swapped;
-    // Reserved for future (for Vulkan) - host device features affecting legal
-    // pipeline descriptions.
-    pipeline_storage_file_header.device_features = 0;
     fwrite(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header),
            1, pipeline_storage_file_);
   }
@@ -840,66 +844,70 @@ D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type,
     // Shader has been previously loaded.
     return it->second;
   }
-
   // Always create the shader and stash it away.
   // We need to track it even if it fails translation so we know not to try
   // again.
   D3D12Shader* shader =
       new D3D12Shader(shader_type, data_hash, host_address, dword_count);
   shaders_.emplace(data_hash, shader);
-  if (!cvars::dump_shaders.empty()) {
-    shader->DumpUcodeBinary(cvars::dump_shaders);
-  }
-
   return shader;
 }
 
-bool PipelineCache::GetCurrentShaderModifications(
-    DxbcShaderTranslator::Modification& vertex_shader_modification_out,
-    DxbcShaderTranslator::Modification& pixel_shader_modification_out) const {
-  Shader::HostVertexShaderType host_vertex_shader_type =
-      GetCurrentHostVertexShaderTypeIfValid();
-  if (host_vertex_shader_type == Shader::HostVertexShaderType(-1)) {
-    return false;
-  }
-  vertex_shader_modification_out = DxbcShaderTranslator::Modification(
-      shader_translator_->GetDefaultModification(xenos::ShaderType::kVertex,
-                                                 host_vertex_shader_type));
-  DxbcShaderTranslator::Modification pixel_shader_modification(
-      shader_translator_->GetDefaultModification(xenos::ShaderType::kPixel));
-  if (!edram_rov_used_) {
-    const auto& regs = register_file_;
-    using DepthStencilMode =
-        DxbcShaderTranslator::Modification::DepthStencilMode;
-    if ((depth_float24_conversion_ ==
-             flags::DepthFloat24Conversion::kOnOutputTruncating ||
-         depth_float24_conversion_ ==
-             flags::DepthFloat24Conversion::kOnOutputRounding) &&
-        regs.Get<reg::RB_DEPTHCONTROL>().z_enable &&
-        regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
-            xenos::DepthRenderTargetFormat::kD24FS8) {
-      pixel_shader_modification.depth_stencil_mode =
-          depth_float24_conversion_ ==
-                  flags::DepthFloat24Conversion::kOnOutputTruncating
-              ? DepthStencilMode::kFloat24Truncating
-              : DepthStencilMode::kFloat24Rounding;
-    } else {
-      // Hint to enable early depth/stencil writing if possible - whether it
-      // will actually take effect depends on the shader itself, it's not known
-      // before translation.
-      auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
-      if ((!rb_colorcontrol.alpha_test_enable ||
-           rb_colorcontrol.alpha_func == xenos::CompareFunction::kAlways) &&
-          !rb_colorcontrol.alpha_to_mask_enable) {
+bool PipelineCache::GetCurrentShaderModification(
+    const Shader& shader,
+    DxbcShaderTranslator::Modification& modification_out) const {
+  assert_true(shader.is_ucode_analyzed());
+  const auto& regs = register_file_;
+  auto sq_program_cntl = regs.Get<reg::SQ_PROGRAM_CNTL>();
+  if (shader.type() == xenos::ShaderType::kVertex) {
+    Shader::HostVertexShaderType host_vertex_shader_type =
+        GetCurrentHostVertexShaderTypeIfValid();
+    if (host_vertex_shader_type == Shader::HostVertexShaderType(-1)) {
+      return false;
+    }
+    modification_out = DxbcShaderTranslator::Modification(
+        shader_translator_->GetDefaultModification(
+            xenos::ShaderType::kVertex,
+            shader.GetDynamicAddressableRegisterCount(
+                sq_program_cntl.vs_num_reg),
+            host_vertex_shader_type));
+  } else {
+    assert_true(shader.type() == xenos::ShaderType::kPixel);
+    DxbcShaderTranslator::Modification pixel_shader_modification(
+        shader_translator_->GetDefaultModification(
+            xenos::ShaderType::kPixel,
+            shader.GetDynamicAddressableRegisterCount(
+                sq_program_cntl.ps_num_reg)));
+    if (!edram_rov_used_) {
+      using DepthStencilMode =
+          DxbcShaderTranslator::Modification::DepthStencilMode;
+      if ((depth_float24_conversion_ ==
+               flags::DepthFloat24Conversion::kOnOutputTruncating ||
+           depth_float24_conversion_ ==
+               flags::DepthFloat24Conversion::kOnOutputRounding) &&
+          draw_util::GetDepthControlForCurrentEdramMode(regs).z_enable &&
+          regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
+              xenos::DepthRenderTargetFormat::kD24FS8) {
         pixel_shader_modification.depth_stencil_mode =
-            DepthStencilMode::kEarlyHint;
+            depth_float24_conversion_ ==
+                    flags::DepthFloat24Conversion::kOnOutputTruncating
+                ? DepthStencilMode::kFloat24Truncating
+                : DepthStencilMode::kFloat24Rounding;
       } else {
-        pixel_shader_modification.depth_stencil_mode =
-            DepthStencilMode::kNoModifiers;
+        if (shader.implicit_early_z_write_allowed() &&
+            (!shader.writes_color_target(0) ||
+             !draw_util::DoesCoverageDependOnAlpha(
+                 regs.Get<reg::RB_COLORCONTROL>()))) {
+          pixel_shader_modification.depth_stencil_mode =
+              DepthStencilMode::kEarlyHint;
+        } else {
+          pixel_shader_modification.depth_stencil_mode =
+              DepthStencilMode::kNoModifiers;
+        }
       }
     }
+    modification_out = pixel_shader_modification;
   }
-  pixel_shader_modification_out = pixel_shader_modification;
   return true;
 }
 
@@ -979,62 +987,6 @@ PipelineCache::GetCurrentHostVertexShaderTypeIfValid() const {
   return Shader::HostVertexShaderType(-1);
 }
 
-bool PipelineCache::EnsureShadersTranslated(
-    D3D12Shader::D3D12Translation* vertex_shader,
-    D3D12Shader::D3D12Translation* pixel_shader) {
-  const auto& regs = register_file_;
-  auto sq_program_cntl = regs.Get<reg::SQ_PROGRAM_CNTL>();
-
-  // Edge flags are not supported yet (because polygon primitives are not).
-  assert_true(sq_program_cntl.vs_export_mode !=
-                  xenos::VertexShaderExportMode::kPosition2VectorsEdge &&
-              sq_program_cntl.vs_export_mode !=
-                  xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
-  assert_false(sq_program_cntl.gen_index_vtx);
-
-  if (!vertex_shader->is_translated()) {
-    if (!TranslateShader(*shader_translator_, *vertex_shader, sq_program_cntl,
-                         dxbc_converter_, dxc_utils_, dxc_compiler_)) {
-      XELOGE("Failed to translate the vertex shader!");
-      return false;
-    }
-    if (shader_storage_file_ && vertex_shader->shader().ucode_storage_index() !=
-                                    shader_storage_index_) {
-      vertex_shader->shader().set_ucode_storage_index(shader_storage_index_);
-      assert_not_null(storage_write_thread_);
-      shader_storage_file_flush_needed_ = true;
-      {
-        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
-        storage_write_shader_queue_.push_back(
-            std::make_pair(&vertex_shader->shader(), sq_program_cntl));
-      }
-      storage_write_request_cond_.notify_all();
-    }
-  }
-
-  if (pixel_shader != nullptr && !pixel_shader->is_translated()) {
-    if (!TranslateShader(*shader_translator_, *pixel_shader, sq_program_cntl,
-                         dxbc_converter_, dxc_utils_, dxc_compiler_)) {
-      XELOGE("Failed to translate the pixel shader!");
-      return false;
-    }
-    if (shader_storage_file_ &&
-        pixel_shader->shader().ucode_storage_index() != shader_storage_index_) {
-      pixel_shader->shader().set_ucode_storage_index(shader_storage_index_);
-      assert_not_null(storage_write_thread_);
-      shader_storage_file_flush_needed_ = true;
-      {
-        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
-        storage_write_shader_queue_.push_back(
-            std::make_pair(&pixel_shader->shader(), sq_program_cntl));
-      }
-      storage_write_request_cond_.notify_all();
-    }
-  }
-
-  return true;
-}
-
 bool PipelineCache::ConfigurePipeline(
     D3D12Shader::D3D12Translation* vertex_shader,
     D3D12Shader::D3D12Translation* pixel_shader,
@@ -1078,8 +1030,50 @@ bool PipelineCache::ConfigurePipeline(
     }
   }
 
-  if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
-    return false;
+  // Ensure shaders are translated.
+  // Edge flags are not supported yet (because polygon primitives are not).
+  assert_true(register_file_.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
+                  xenos::VertexShaderExportMode::kPosition2VectorsEdge &&
+              register_file_.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
+                  xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
+  assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
+  if (!vertex_shader->is_translated()) {
+    vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+    if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader,
+                                 dxbc_converter_, dxc_utils_, dxc_compiler_)) {
+      XELOGE("Failed to translate the vertex shader!");
+      return false;
+    }
+    if (shader_storage_file_ && vertex_shader->shader().ucode_storage_index() !=
+                                    shader_storage_index_) {
+      vertex_shader->shader().set_ucode_storage_index(shader_storage_index_);
+      assert_not_null(storage_write_thread_);
+      shader_storage_file_flush_needed_ = true;
+      {
+        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+        storage_write_shader_queue_.push_back(&vertex_shader->shader());
+      }
+      storage_write_request_cond_.notify_all();
+    }
+  }
+  if (pixel_shader != nullptr && !pixel_shader->is_translated()) {
+    pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+    if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader,
+                                 dxbc_converter_, dxc_utils_, dxc_compiler_)) {
+      XELOGE("Failed to translate the pixel shader!");
+      return false;
+    }
+    if (shader_storage_file_ &&
+        pixel_shader->shader().ucode_storage_index() != shader_storage_index_) {
+      pixel_shader->shader().set_ucode_storage_index(shader_storage_index_);
+      assert_not_null(storage_write_thread_);
+      shader_storage_file_flush_needed_ = true;
+      {
+        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+        storage_write_shader_queue_.push_back(&pixel_shader->shader());
+      }
+      storage_write_request_cond_.notify_all();
+    }
   }
 
   Pipeline* new_pipeline = new Pipeline;
@@ -1121,17 +1115,15 @@ bool PipelineCache::ConfigurePipeline(
   return true;
 }
 
-bool PipelineCache::TranslateShader(DxbcShaderTranslator& translator,
-                                    D3D12Shader::D3D12Translation& translation,
-                                    reg::SQ_PROGRAM_CNTL cntl,
-                                    IDxbcConverter* dxbc_converter,
-                                    IDxcUtils* dxc_utils,
-                                    IDxcCompiler* dxc_compiler) {
+bool PipelineCache::TranslateAnalyzedShader(
+    DxbcShaderTranslator& translator,
+    D3D12Shader::D3D12Translation& translation, IDxbcConverter* dxbc_converter,
+    IDxcUtils* dxc_utils, IDxcCompiler* dxc_compiler) {
   D3D12Shader& shader = static_cast<D3D12Shader&>(translation.shader());
 
   // Perform translation.
   // If this fails the shader will be marked as invalid and ignored later.
-  if (!translator.Translate(translation, cntl)) {
+  if (!translator.TranslateAnalyzedShader(translation)) {
     XELOGE("Shader {:016X} translation failed; marking as ignored",
            shader.ucode_data_hash());
     return false;
@@ -1171,21 +1163,21 @@ bool PipelineCache::TranslateShader(DxbcShaderTranslator& translator,
 
   // Set up texture and sampler binding layouts.
   if (shader.EnterBindingLayoutUserUIDSetup()) {
-    uint32_t texture_binding_count;
-    const D3D12Shader::TextureBinding* texture_bindings =
-        shader.GetTextureBindings(texture_binding_count);
-    uint32_t sampler_binding_count;
-    const D3D12Shader::SamplerBinding* sampler_bindings =
-        shader.GetSamplerBindings(sampler_binding_count);
+    const std::vector<D3D12Shader::TextureBinding>& texture_bindings =
+        shader.GetTextureBindingsAfterTranslation();
+    uint32_t texture_binding_count = uint32_t(texture_bindings.size());
+    const std::vector<D3D12Shader::SamplerBinding>& sampler_bindings =
+        shader.GetSamplerBindingsAfterTranslation();
+    uint32_t sampler_binding_count = uint32_t(sampler_bindings.size());
     assert_false(bindless_resources_used_ &&
                  texture_binding_count + sampler_binding_count >
                      D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 4);
     size_t texture_binding_layout_bytes =
-        texture_binding_count * sizeof(*texture_bindings);
+        texture_binding_count * sizeof(*texture_bindings.data());
     uint64_t texture_binding_layout_hash = 0;
     if (texture_binding_count) {
       texture_binding_layout_hash =
-          XXH3_64bits(texture_bindings, texture_binding_layout_bytes);
+          XXH3_64bits(texture_bindings.data(), texture_binding_layout_bytes);
     }
     uint32_t bindless_sampler_count =
         bindless_resources_used_ ? sampler_binding_count : 0;
@@ -1223,7 +1215,8 @@ bool PipelineCache::TranslateShader(DxbcShaderTranslator& translator,
           if (it->second.vector_span_length == texture_binding_count &&
               !std::memcmp(texture_binding_layouts_.data() +
                                it->second.vector_span_offset,
-                           texture_bindings, texture_binding_layout_bytes)) {
+                           texture_bindings.data(),
+                           texture_binding_layout_bytes)) {
             texture_binding_layout_uid = it->second.uid;
             break;
           }
@@ -1242,7 +1235,7 @@ bool PipelineCache::TranslateShader(DxbcShaderTranslator& translator,
                                           texture_binding_count);
           std::memcpy(
               texture_binding_layouts_.data() + new_uid.vector_span_offset,
-              texture_bindings, texture_binding_layout_bytes);
+              texture_bindings.data(), texture_binding_layout_bytes);
           texture_binding_layout_map_.emplace(texture_binding_layout_hash,
                                               new_uid);
         }
@@ -1332,6 +1325,21 @@ bool PipelineCache::GetCurrentStateDescription(
   bool tessellated =
       DxbcShaderTranslator::Modification(vertex_shader->modification())
           .host_vertex_shader_type != Shader::HostVertexShaderType::kVertex;
+  bool primitive_polygonal =
+      xenos::IsPrimitivePolygonal(tessellated, primitive_type);
+  bool rasterization_enabled =
+      draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
+  // In Direct3D, rasterization (along with pixel counting) is disabled by
+  // disabling the pixel shader and depth / stencil. However, if rasterization
+  // should be disabled, the pixel shader must be disabled externally, to ensure
+  // things like texture binding layout is correct for the shader actually being
+  // used (don't replace anything here).
+  if (!rasterization_enabled) {
+    assert_null(pixel_shader);
+    if (pixel_shader) {
+      return false;
+    }
+  }
 
   // Root signature.
   runtime_description_out.root_signature = command_processor_.GetRootSignature(
@@ -1343,17 +1351,11 @@ bool PipelineCache::GetCurrentStateDescription(
     return false;
   }
 
-  // Shaders.
+  // Vertex shader.
   runtime_description_out.vertex_shader = vertex_shader;
   description_out.vertex_shader_hash =
       vertex_shader->shader().ucode_data_hash();
   description_out.vertex_shader_modification = vertex_shader->modification();
-  if (pixel_shader) {
-    runtime_description_out.pixel_shader = pixel_shader;
-    description_out.pixel_shader_hash =
-        pixel_shader->shader().ucode_data_hash();
-    description_out.pixel_shader_modification = pixel_shader->modification();
-  }
 
   // Index buffer strip cut value.
   if (pa_su_sc_mode_cntl.multi_prim_ib_ena) {
@@ -1407,8 +1409,20 @@ bool PipelineCache::GetCurrentStateDescription(
     }
   }
 
-  bool primitive_polygonal =
-      xenos::IsPrimitivePolygonal(tessellated, primitive_type);
+  // The rest doesn't matter when rasterization is disabled (thus no writing to
+  // anywhere from post-geometry stages and no samples are counted).
+  if (!rasterization_enabled) {
+    description_out.cull_mode = PipelineCullMode::kDisableRasterization;
+    return true;
+  }
+
+  // Pixel shader.
+  if (pixel_shader) {
+    runtime_description_out.pixel_shader = pixel_shader;
+    description_out.pixel_shader_hash =
+        pixel_shader->shader().ucode_data_hash();
+    description_out.pixel_shader_modification = pixel_shader->modification();
+  }
 
   // Rasterizer state.
   // Because Direct3D 12 doesn't support per-side fill mode and depth bias, the
@@ -1424,7 +1438,8 @@ bool PipelineCache::GetCurrentStateDescription(
   // developer didn't want to fill the whole primitive and use wireframe (like
   // Xenos fill mode 1).
   // Here we also assume that only one side is culled - if two sides are culled,
-  // the D3D12 command processor will drop such draw early.
+  // rasterization will be disabled externally, or the draw call will be dropped
+  // early if the vertex shader doesn't export to memory.
   bool cull_front, cull_back;
   float poly_offset = 0.0f, poly_offset_scale = 0.0f;
   if (primitive_polygonal) {
@@ -1432,6 +1447,9 @@ bool PipelineCache::GetCurrentStateDescription(
     cull_front = pa_su_sc_mode_cntl.cull_front != 0;
     cull_back = pa_su_sc_mode_cntl.cull_back != 0;
     if (cull_front) {
+      // The case when both faces are culled should be handled by disabling
+      // rasterization.
+      assert_false(cull_back);
       description_out.cull_mode = PipelineCullMode::kFront;
     } else if (cull_back) {
       description_out.cull_mode = PipelineCullMode::kBack;
@@ -1518,7 +1536,8 @@ bool PipelineCache::GetCurrentStateDescription(
     // Depth/stencil. No stencil, always passing depth test and no depth writing
     // means depth disabled.
     if (render_targets[4].format != DXGI_FORMAT_UNKNOWN) {
-      auto rb_depthcontrol = regs.Get<reg::RB_DEPTHCONTROL>();
+      auto rb_depthcontrol =
+          draw_util::GetDepthControlForCurrentEdramMode(regs);
       if (rb_depthcontrol.z_enable) {
         description_out.depth_func = rb_depthcontrol.zfunc;
         description_out.depth_write = rb_depthcontrol.z_write_enable;
@@ -1576,8 +1595,10 @@ bool PipelineCache::GetCurrentStateDescription(
 
     // Render targets and blending state. 32 because of 0x1F mask, for safety
     // (all unknown to zero).
-    uint32_t color_mask = command_processor_.GetCurrentColorMask(
-        pixel_shader ? &pixel_shader->shader() : nullptr);
+    uint32_t color_mask =
+        pixel_shader ? command_processor_.GetCurrentColorMask(
+                           pixel_shader->shader().writes_color_targets())
+                     : 0;
     static const PipelineBlendFactor kBlendFactorMap[32] = {
         /*  0 */ PipelineBlendFactor::kZero,
         /*  1 */ PipelineBlendFactor::kOne,
@@ -1858,6 +1879,9 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       state_desc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
       break;
     default:
+      assert_true(description.cull_mode == PipelineCullMode::kNone ||
+                  description.cull_mode ==
+                      PipelineCullMode::kDisableRasterization);
       state_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
       break;
   }
@@ -1984,6 +2008,23 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     }
   }
 
+  // Disable rasterization if needed (parameter combinations that make no
+  // difference when rasterization is disabled have already been handled in
+  // GetCurrentStateDescription) the way it's disabled in Direct3D by design
+  // (disabling a pixel shader and depth / stencil).
+  // TODO(Triang3l): When it happens to be that a combination of parameters
+  // (no host pixel shader and depth / stencil without ROV) would disable
+  // rasterization when it's still needed (for occlusion query sample counting),
+  // ensure rasterization happens (by binding an empty pixel shader, or maybe
+  // via ForcedSampleCount when not using 2x MSAA - its requirements for
+  // OMSetRenderTargets need some investigation though).
+  if (description.cull_mode == PipelineCullMode::kDisableRasterization) {
+    state_desc.PS.pShaderBytecode = nullptr;
+    state_desc.PS.BytecodeLength = 0;
+    state_desc.DepthStencilState.DepthEnable = FALSE;
+    state_desc.DepthStencilState.StencilEnable = FALSE;
+  }
+
   // Create the D3D12 pipeline state object.
   auto device =
       command_processor_.GetD3D12Context().GetD3D12Provider().GetDevice();
@@ -2038,7 +2079,7 @@ void PipelineCache::StorageWriteThread() {
       fflush(pipeline_storage_file_);
     }
 
-    std::pair<const Shader*, reg::SQ_PROGRAM_CNTL> shader_pair = {};
+    const Shader* shader = nullptr;
     PipelineStoredDescription pipeline_description;
     bool write_pipeline = false;
     {
@@ -2047,7 +2088,7 @@ void PipelineCache::StorageWriteThread() {
         return;
       }
       if (!storage_write_shader_queue_.empty()) {
-        shader_pair = storage_write_shader_queue_.front();
+        shader = storage_write_shader_queue_.front();
         storage_write_shader_queue_.pop_front();
       } else if (storage_write_flush_shaders_) {
         storage_write_flush_shaders_ = false;
@@ -2063,18 +2104,16 @@ void PipelineCache::StorageWriteThread() {
         storage_write_flush_pipelines_ = false;
         flush_pipelines = true;
       }
-      if (!shader_pair.first && !write_pipeline) {
+      if (!shader && !write_pipeline) {
         storage_write_request_cond_.wait(lock);
         continue;
       }
     }
 
-    const Shader* shader = shader_pair.first;
     if (shader) {
       shader_header.ucode_data_hash = shader->ucode_data_hash();
       shader_header.ucode_dword_count = shader->ucode_dword_count();
       shader_header.type = shader->type();
-      shader_header.sq_program_cntl = shader_pair.second;
       assert_not_null(shader_storage_file_);
       fwrite(&shader_header, sizeof(shader_header), 1, shader_storage_file_);
       if (shader_header.ucode_dword_count) {
