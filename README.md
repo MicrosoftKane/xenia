@@ -5,6 +5,10 @@
 </p>
 
 <h1 align="center">Xenia - Xbox 360 Emulator</h1>
+记录一下修改内容：
+
+* 键盘修改，详见 hid/winkey/winkey_input_driver.cc
+* 取消日志文件，反正我也用不到哈~
 
 Xenia is an experimental emulator for the Xbox 360. For more information, see the
 [main Xenia wiki](https://github.com/xenia-project/xenia/wiki).

@@ -12,7 +12,7 @@
 1.方向键改为编辑键区
 2.ABXY改为ZXCV
 3.Start和Back改为ENTER和BACKSPACE
-4.Right stick改为P ; , L '
+4.Right stick改为P ; L '
 */
 
 #include "xenia/hid/winkey/winkey_input_driver.h"
