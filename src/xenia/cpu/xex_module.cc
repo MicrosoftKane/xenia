@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2020 Ben Vanik. All rights reserved.                             *
+ * Copyright 2021 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -249,12 +249,11 @@ int XexModule::ApplyPatch(XexModule* module) {
 
   // Patch base XEX header
   uint32_t original_image_size = module->image_size();
-  uint32_t header_target_size = patch_header->delta_headers_target_offset +
-                                patch_header->delta_headers_source_size;
+  uint32_t header_target_size = patch_header->size_of_target_headers;
 
   if (!header_target_size) {
-    header_target_size =
-        patch_header->size_of_target_headers;  // unsure which is more correct..
+    header_target_size = patch_header->delta_headers_target_offset +
+                         patch_header->delta_headers_source_size;
   }
 
   size_t mem_size = module->xex_header_mem_.size();
@@ -449,14 +448,9 @@ int XexModule::ApplyPatch(XexModule* module) {
       }
     }
 
-    // byteswap versions because of bitfields...
     xex2_version source_ver, target_ver;
-    source_ver.value =
-        xe::byte_swap<uint32_t>(patch_header->source_version.value);
-
-    target_ver.value =
-        xe::byte_swap<uint32_t>(patch_header->target_version.value);
-
+    source_ver = patch_header->source_version();
+    target_ver = patch_header->target_version();
     XELOGI(
         "XEX patch applied successfully: base version: {}.{}.{}.{}, new "
         "version: {}.{}.{}.{}",
@@ -838,9 +832,10 @@ int XexModule::ReadPEHeaders() {
 // offsetof seems to be unable to find OptionalHeader.
 #define offsetof1(type, member) ((std::size_t) & (((type*)0)->member))
 #define IMAGE_FIRST_SECTION1(ntheader)                                   \
-  ((PIMAGE_SECTION_HEADER)(                                              \
-      (uint8_t*)ntheader + offsetof1(IMAGE_NT_HEADERS, OptionalHeader) + \
-      ((PIMAGE_NT_HEADERS)(ntheader))->FileHeader.SizeOfOptionalHeader))
+  ((PIMAGE_SECTION_HEADER)((uint8_t*)ntheader +                          \
+                           offsetof1(IMAGE_NT_HEADERS, OptionalHeader) + \
+                           ((PIMAGE_NT_HEADERS)(ntheader))               \
+                               ->FileHeader.SizeOfOptionalHeader))
 
   // Quick scan to determine bounds of sections.
   size_t upper_address = 0;
@@ -904,9 +899,9 @@ bool XexModule::Load(const std::string_view name, const std::string_view path,
                      const void* xex_addr, size_t xex_length) {
   auto src_header = reinterpret_cast<const xex2_header*>(xex_addr);
 
-  if (src_header->magic == 'XEX1') {
+  if (src_header->magic == kXEX1Signature) {
     xex_format_ = kFormatXex1;
-  } else if (src_header->magic == 'XEX2') {
+  } else if (src_header->magic == kXEX2Signature) {
     xex_format_ = kFormatXex2;
   } else {
     return false;
@@ -970,6 +965,16 @@ bool XexModule::LoadContinue() {
   if (ReadPEHeaders()) {
     XELOGE("Failed to load XEX PE headers!");
     return false;
+  }
+
+  // Parse any "unsafe" headers into safer variants
+  xex2_opt_generic_u32* alternate_titleids;
+  if (GetOptHeader(xex2_header_keys::XEX_HEADER_ALTERNATE_TITLE_IDS,
+                   &alternate_titleids)) {
+    auto count = alternate_titleids->count();
+    for (uint32_t i = 0; i < count; i++) {
+      opt_alternate_title_ids_.push_back(alternate_titleids->values[i]);
+    }
   }
 
   // Scan and find the low/high addresses.
@@ -1112,8 +1117,8 @@ bool XexModule::SetupLibraryImports(const std::string_view name,
   ImportLibrary library_info;
   library_info.name = base_name;
   library_info.id = library->id;
-  library_info.version.value = library->version.value;
-  library_info.min_version.value = library->version_min.value;
+  library_info.version.value = library->version().value;
+  library_info.min_version.value = library->version_min().value;
 
   // Imports are stored as {import descriptor, thunk addr, import desc, ...}
   // Even thunks have an import descriptor (albeit unused/useless)
